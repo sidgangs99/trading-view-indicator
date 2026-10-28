@@ -1,0 +1,256 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+//  Liquidity Candlestick + Swing Detector (improved)
+//  • Candlestick patterns: Hammer, Inverted Hammer, Shooting Star,
+//    Bullish / Bearish Engulfing, Doji
+//  • Three-candle swing highs / lows, drawn on the exact middle candle
+//    at its exact high / low
+//  • Everything confirmed on bar close (barstate.isconfirmed) → no repaint
+// ─────────────────────────────────────────────────────────────────────────────
+indicator("Liquidity Candlestick + Swing Detector", shorttitle = "LCSD", overlay = true,
+     max_labels_count = 500, max_bars_back = 100)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 1. CANDLE PATTERN SETTINGS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+grp = "Candlestick Patterns"
+showHammer    = input.bool(true,  "Hammer",            group = grp)
+showInvHammer = input.bool(true,  "Inverted Hammer",   group = grp)
+showShooting  = input.bool(true,  "Shooting Star",     group = grp)
+showBullEng   = input.bool(true,  "Bullish Engulfing", group = grp)
+showBearEng   = input.bool(true,  "Bearish Engulfing", group = grp)
+showDoji      = input.bool(false, "Doji",              group = grp)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 2. CANDLE FILTERS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+grpFilter = "Candle Filters"
+atrLen   = input.int(14,    "ATR Length",                 minval = 1,             group = grpFilter)
+minATR   = input.float(0.3, "Minimum Candle Range × ATR", minval = 0, step = 0.1, group = grpFilter)
+trendLen = input.int(4,     "Prior Trend Lookback",       minval = 1,             group = grpFilter)
+useTrend = input.bool(true, "Require Prior Trend",                                group = grpFilter)
+
+grpShape = "Candle Shape"
+wickRatio = input.float(2.0,  "Dominant Wick / Body",     minval = 1,    step = 0.25,               group = grpShape)
+oppRatio  = input.float(0.5,  "Opposite Wick / Body Max", minval = 0,    step = 0.1,                group = grpShape)
+dojiRatio = input.float(0.10, "Doji Body / Range Max",    minval = 0.01, maxval = 0.3, step = 0.01, group = grpShape)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 3. THREE-CANDLE SWING SETTINGS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+grpSwing = "Three-Candle Swing"
+showSwingHigh = input.bool(true, "Show Swing High", group = grpSwing)
+showSwingLow  = input.bool(true, "Show Swing Low",  group = grpSwing)
+skipInside    = input.bool(true, "Ignore inside bars", group = grpSwing,
+     tooltip = "ON: an inside bar does not confirm a swing. The swing waits for the first candle that breaks the middle candle's range, and the left neighbour also skips inside bars. Prevents one candle being marked as both SH and SL.")
+maxInside     = input.int(5, "Max inside bars to skip", minval = 1, maxval = 20, group = grpSwing)
+allowEqual    = input.bool(true, "Mark equal highs / lows (double tops / bottoms)", group = grpSwing,
+     tooltip = "ON: if the middle candle's high equals the left candle's high, it still counts (the later candle of the pair is marked). OFF: strict 3-candle rule.")
+alternate     = input.bool(false, "Alternate swings (High → Low → High)", group = grpSwing,
+     tooltip = "ON: two swing highs in a row without a swing low between them are not allowed; only the higher one is kept (the older label is removed). Same for lows.")
+swingHighColor = input.color(color.red,   "Swing High Color", group = grpSwing)
+swingLowColor  = input.color(color.green, "Swing Low Color",  group = grpSwing)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 4. LABEL SETTINGS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+grpLbl    = "Pattern Labels"
+patPad    = input.float(0.6, "Distance from candle (× ATR)", minval = 0, step = 0.1, group = grpLbl,
+     tooltip = "Pushes pattern labels away from the candle so they don't cover the SH / SL markers.")
+bullColor = input.color(color.green,  "Bullish label", group = grpLbl)
+bearColor = input.color(color.red,    "Bearish label", group = grpLbl)
+dojiColor = input.color(color.orange, "Doji label",    group = grpLbl)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 5. CANDLE CALCULATIONS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+atr       = ta.atr(atrLen)
+body      = math.abs(close - open)
+rng       = high - low
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+
+validCandle = rng > 0 and rng >= minATR * atr
+validBody   = body > 0 and body > rng * dojiRatio
+
+downTrend = not useTrend or close[1] < close[trendLen + 1]
+upTrend   = not useTrend or close[1] > close[trendLen + 1]
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 6. CANDLESTICK PATTERNS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+hammerShape = validCandle and validBody and lowerWick >= wickRatio * body and upperWick <= oppRatio * body
+invShape    = validCandle and validBody and upperWick >= wickRatio * body and lowerWick <= oppRatio * body
+
+hammer    = showHammer    and hammerShape and downTrend
+invHammer = showInvHammer and invShape    and downTrend
+shooting  = showShooting  and invShape    and upTrend
+doji      = showDoji      and validCandle and body <= dojiRatio * rng
+
+bullEng = showBullEng and close[1] < open[1] and close > open and open <= close[1] and close >= open[1] and body > 0
+bearEng = showBearEng and close[1] > open[1] and close < open and open >= close[1] and close <= open[1] and body > 0
+
+sigHammer    = hammer    and barstate.isconfirmed
+sigInvHammer = invHammer and barstate.isconfirmed
+sigShooting  = shooting  and barstate.isconfirmed
+sigBullEng   = bullEng   and barstate.isconfirmed
+sigBearEng   = bearEng   and barstate.isconfirmed
+sigDoji      = doji      and barstate.isconfirmed
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 7. THREE-CANDLE SWING DETECTION
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Rule: the middle candle's high is above both neighbours (swing high), or
+// its low is below both neighbours (swing low). The swing is confirmed when
+// the right-hand candle closes.
+//
+// Fixes vs. the original:
+//  • Inside bars: an inside bar has a lower high AND a higher low than the
+//    middle candle, so the old code marked the middle candle as BOTH SH and
+//    SL. Now the swing waits for the first candle that breaks out of the
+//    middle candle's range (optional, up to "Max inside bars to skip").
+//  • Left neighbour: if the candle before the middle one is an inside bar,
+//    we compare against its "mother" bar instead, so a lower high that sits
+//    inside a bigger candle is no longer marked as a swing.
+//  • Equal highs / lows: the old strict ">" ignored double tops / bottoms.
+//  • Labels are drawn with label.new() on the exact middle candle and exact
+//    price instead of plotshape(offset = -1), so they can't drift or stack
+//    onto the pattern labels.
+
+// Draws one swing label and returns it (so it can be deleted when alternating).
+drawSwing(int idx, float price, bool isHigh) =>
+    label.new(idx, price, isHigh ? "SH" : "SL", xloc = xloc.bar_index, yloc = yloc.price,
+         style     = isHigh ? label.style_label_down : label.style_label_up,
+         color     = isHigh ? swingHighColor : swingLowColor,
+         textcolor = color.white, size = size.tiny,
+         tooltip   = (isHigh ? "Swing High: " : "Swing Low: ") + str.tostring(price, format.mintick))
+
+// State for the optional alternation rule
+var int   lastSwingType  = 0      // 1 = last swing was a high, -1 = a low
+var float lastSwingPrice = na
+var label lastSwingLabel = na
+
+bool confirmedSwingHigh = false
+bool confirmedSwingLow  = false
+
+if barstate.isconfirmed and (showSwingHigh or showSwingLow)
+    int maxK = skipInside ? maxInside + 1 : 1
+    // k = distance (in bars) from the current candle back to the middle candle.
+    // Oldest candidates first so the alternation rule sees swings in order.
+    for k = maxK to 1
+        if bar_index <= k + 1
+            continue
+
+        // a) Every candle between the middle candle and now must be an inside bar of it
+        bool betweenInside = true
+        if k > 1
+            for j = 1 to k - 1
+                if high[j] > high[k] or low[j] < low[k]
+                    betweenInside := false
+                    break
+        if not betweenInside
+            continue
+
+        // b) The current (confirming) candle must not be an inside bar of the middle candle
+        if skipInside and high <= high[k] and low >= low[k]
+            continue
+
+        // c) Left neighbour: skip inside bars back to their mother bar
+        int L = k + 1
+        if skipInside
+            int steps = 0
+            while steps < maxInside and high[L] <= high[L + 1] and low[L] >= low[L + 1]
+                L += 1
+                steps += 1
+
+        float hMid = high[k]
+        float lMid = low[k]
+        int   idx  = bar_index - k
+
+        bool isSH = showSwingHigh and hMid > high and (allowEqual ? hMid >= high[L] : hMid > high[L])
+        bool isSL = showSwingLow  and lMid < low  and (allowEqual ? lMid <= low[L]  : lMid < low[L])
+
+        if isSH
+            if alternate and lastSwingType == 1
+                // Two highs in a row: keep only the higher one
+                if hMid > lastSwingPrice
+                    label.delete(lastSwingLabel)
+                    lastSwingLabel     := drawSwing(idx, hMid, true)
+                    lastSwingPrice     := hMid
+                    confirmedSwingHigh := true
+            else
+                lastSwingLabel     := drawSwing(idx, hMid, true)
+                lastSwingType      := 1
+                lastSwingPrice     := hMid
+                confirmedSwingHigh := true
+
+        if isSL
+            if alternate and lastSwingType == -1
+                // Two lows in a row: keep only the lower one
+                if lMid < lastSwingPrice
+                    label.delete(lastSwingLabel)
+                    lastSwingLabel    := drawSwing(idx, lMid, false)
+                    lastSwingPrice    := lMid
+                    confirmedSwingLow := true
+            else
+                lastSwingLabel    := drawSwing(idx, lMid, false)
+                lastSwingType     := -1
+                lastSwingPrice    := lMid
+                confirmedSwingLow := true
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 8. CANDLE PATTERN LABELS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// One label per side per candle (names stacked) so patterns never overlap
+// each other; offset by ATR so they sit beyond the SH / SL markers.
+addLine(string s, string name) => s == "" ? name : s + "\n" + name
+
+string belowTxt = ""
+if sigHammer
+    belowTxt := addLine(belowTxt, "HAM")
+if sigInvHammer
+    belowTxt := addLine(belowTxt, "INV")
+if sigBullEng
+    belowTxt := addLine(belowTxt, "B-ENG")
+
+string aboveTxt = ""
+bool   aboveBear = false
+if sigShooting
+    aboveTxt  := addLine(aboveTxt, "SHOOT")
+    aboveBear := true
+if sigBearEng
+    aboveTxt  := addLine(aboveTxt, "S-ENG")
+    aboveBear := true
+if sigDoji
+    aboveTxt := addLine(aboveTxt, "DOJI")
+
+float pad = patPad * atr
+if belowTxt != ""
+    label.new(bar_index, low - pad, belowTxt, yloc = yloc.price, style = label.style_label_up,
+         color = bullColor, textcolor = color.white, size = size.tiny)
+if aboveTxt != ""
+    label.new(bar_index, high + pad, aboveTxt, yloc = yloc.price, style = label.style_label_down,
+         color = aboveBear ? bearColor : dojiColor, textcolor = aboveBear ? color.white : color.black, size = size.tiny)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 9. INDIVIDUAL ALERTS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+alertcondition(sigHammer,    "Hammer",            "{{ticker}} {{interval}} Hammer confirmed")
+alertcondition(sigInvHammer, "Inverted Hammer",   "{{ticker}} {{interval}} Inverted Hammer confirmed")
+alertcondition(sigShooting,  "Shooting Star",     "{{ticker}} {{interval}} Shooting Star confirmed")
+alertcondition(sigBullEng,   "Bullish Engulfing", "{{ticker}} {{interval}} Bullish Engulfing confirmed")
+alertcondition(sigBearEng,   "Bearish Engulfing", "{{ticker}} {{interval}} Bearish Engulfing confirmed")
+alertcondition(sigDoji,      "Doji",              "{{ticker}} {{interval}} Doji confirmed")
+
+alertcondition(confirmedSwingHigh, "3-Candle Swing High", "{{ticker}} {{interval}} 3-candle swing high confirmed")
+alertcondition(confirmedSwingLow,  "3-Candle Swing Low",  "{{ticker}} {{interval}} 3-candle swing low confirmed")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 10. GROUPED ALERTS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bullishPattern = sigHammer or sigInvHammer or sigBullEng
+bearishPattern = sigShooting or sigBearEng
+
+alertcondition(bullishPattern, "Any Bullish Pattern", "{{ticker}} {{interval}} Bullish candlestick pattern")
+alertcondition(bearishPattern, "Any Bearish Pattern", "{{ticker}} {{interval}} Bearish candlestick pattern")
+alertcondition(confirmedSwingHigh or confirmedSwingLow, "Any 3-Candle Swing", "{{ticker}} {{interval}} 3-candle swing confirmed")
